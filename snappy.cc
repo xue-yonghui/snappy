@@ -42,6 +42,11 @@
 #if SNAPPY_HAVE_SSE2
 #include <emmintrin.h>
 #endif
+
+#if ARCH_ARM
+#include <arm_neon.h>
+#endif
+
 #include <stdio.h>
 
 #include <algorithm>
@@ -53,6 +58,7 @@ namespace snappy {
 
 using internal::COPY_1_BYTE_OFFSET;
 using internal::COPY_2_BYTE_OFFSET;
+using internal::COPY_4_BYTE_OFFSET;
 using internal::LITERAL;
 using internal::char_table;
 using internal::kMaximumTagLength;
@@ -63,12 +69,21 @@ using internal::kMaximumTagLength;
 // input. Of course, it doesn't hurt if the hash function is reasonably fast
 // either, as it gets called a lot.
 static inline uint32 HashBytes(uint32 bytes, int shift) {
-  uint32 kMul = 0x1e35a7bd;
+  const uint32 kMul = 0x1e35a7bd;
   return (bytes * kMul) >> shift;
 }
 static inline uint32 Hash(const char* p, int shift) {
   return HashBytes(UNALIGNED_LOAD32(p), shift);
 }
+
+#if ARCH_ARM
+static inline void Prefetch(const void* data) {
+	__asm__ __volatile__(
+		"prfm PLDL1STRM, [%[data]]		\n\t"
+		:: [data] "r" (data)
+	);
+}
+#endif // ARCH_ARM
 
 size_t MaxCompressedLength(size_t source_len) {
   // Compressed data can be defined as:
@@ -184,12 +199,12 @@ inline char* IncrementalCopy(const char* src, char* op, char* const op_limit,
     // abcabcxxxxx
     // abcabcabcabcxxxxx
     //    ^
-    // The last x is 14 bytes after ^.
-    if (SNAPPY_PREDICT_TRUE(op <= buf_limit - 14)) {
+    // The last x is 11 bytes after ^.
+    if (SNAPPY_PREDICT_TRUE(op <= buf_limit - 11)) {
       while (pattern_size < 8) {
         UnalignedCopy64(src, op);
         op += pattern_size;
-        pattern_size *= 2;
+        pattern_size <<= 1;
       }
       if (SNAPPY_PREDICT_TRUE(op >= op_limit)) return op_limit;
     } else {
@@ -202,9 +217,22 @@ inline char* IncrementalCopy(const char* src, char* op, char* const op_limit,
   // UnalignedCopy128 might overwrite data in op. UnalignedCopy64 is safe
   // because expanding the pattern to at least 8 bytes guarantees that
   // op - src >= 8.
-  while (op <= buf_limit - 16) {
+  const char* loop_limit = buf_limit - 16;
+  while (op <= loop_limit) {
+#if ARCH_ARM
+	__asm__ __volatile__(
+		"ldr d0, [%[src]]   	\n\t"
+		"str d0, [%[op]]    	\n\t"
+		"ldr d1, [%[src], #8]	\n\t"
+		"str d1, [%[op], #8]	\n\t"
+		: [op] "+r" (op)
+		: [src] "r" (src)
+		: "d0", "d1"
+	);
+#else
     UnalignedCopy64(src, op);
     UnalignedCopy64(src + 8, op + 8);
+#endif
     src += 16;
     op += 16;
     if (SNAPPY_PREDICT_TRUE(op >= op_limit)) return op_limit;
@@ -219,7 +247,7 @@ inline char* IncrementalCopy(const char* src, char* op, char* const op_limit,
   return IncrementalCopySlow(src, op, op_limit);
 }
 
-}  // namespace
+}  // namespaceEncode32
 
 static inline char* EmitLiteral(char* op,
                                 const char* literal,
@@ -237,30 +265,27 @@ static inline char* EmitLiteral(char* op,
   //     MaxCompressedLength).
   assert(len > 0);      // Zero-length literals are disallowed
   int n = len - 1;
-  if (allow_fast_path && len <= 16) {
+  if (allow_fast_path && SNAPPY_PREDICT_TRUE(len <= 16)) {
     // Fits in tag byte
     *op++ = LITERAL | (n << 2);
-
+#if ARCH_ARM
+	vst1q_u64((uint64_t*)op, vld1q_u64((const uint64_t*)literal));
+#else
     UnalignedCopy128(literal, op);
+#endif
     return op + len;
   }
 
-  if (n < 60) {
+  if (SNAPPY_PREDICT_TRUE(n < 60)) {
     // Fits in tag byte
     *op++ = LITERAL | (n << 2);
   } else {
-    // Encode in upcoming bytes
-    char* base = op;
-    int count = 0;
-    op++;
-    while (n > 0) {
-      *op++ = n & 0xff;
-      n >>= 8;
-      count++;
-    }
+    int count = (Bits::Log2Floor(n) >> 3) + 1;
     assert(count >= 1);
     assert(count <= 4);
-    *base = LITERAL | ((59+count) << 2);
+    *op++ = LITERAL | ((59 + count) << 2);
+    LittleEndian::Store32(op,n);
+    op += count;
   }
   memcpy(op, literal, len);
   return op + len;
@@ -471,12 +496,12 @@ char* CompressFragment(const char* input,
         if (SNAPPY_PREDICT_FALSE(next_ip > ip_limit)) {
           goto emit_remainder;
         }
-        next_hash = Hash(next_ip, shift);
         candidate = base_ip + table[hash];
         assert(candidate >= base_ip);
         assert(candidate < ip);
 
         table[hash] = ip - base_ip;
+        next_hash = Hash(next_ip, shift);
       } while (SNAPPY_PREDICT_TRUE(UNALIGNED_LOAD32(ip) !=
                                  UNALIGNED_LOAD32(candidate)));
 
@@ -496,17 +521,22 @@ char* CompressFragment(const char* input,
       // this loop via goto if we get close to exhausting the input.
       EightBytesReference input_bytes;
       uint32 candidate_bytes = 0;
+      uint32 prev_val = 0;
+      uint32 cur_val = 0;
+      uint32 next_val = 0;
 
       do {
         // We have a 4-byte match at ip, and no need to emit any
         // "literal bytes" prior to ip.
-        const char* base = ip;
+#if defined(ARCH_ARM)
+		Prefetch(ip + 256);
+#endif
+        size_t offset = ip - candidate;
         std::pair<size_t, bool> p =
             FindMatchLength(candidate + 4, ip + 4, ip_end);
         size_t matched = 4 + p.first;
+        assert(0 == memcmp(ip, candidate, matched));
         ip += matched;
-        size_t offset = base - candidate;
-        assert(0 == memcmp(base, candidate, matched));
         op = EmitCopy(op, offset, matched, p.second);
         next_emit = ip;
         if (SNAPPY_PREDICT_FALSE(ip >= ip_limit)) {
@@ -516,15 +546,19 @@ char* CompressFragment(const char* input,
         // table[Hash(ip, shift)] for that.  To improve compression,
         // we also update table[Hash(ip - 1, shift)] and table[Hash(ip, shift)].
         input_bytes = GetEightBytesAt(ip - 1);
-        uint32 prev_hash = HashBytes(GetUint32AtOffset(input_bytes, 0), shift);
-        table[prev_hash] = ip - base_ip - 1;
-        uint32 cur_hash = HashBytes(GetUint32AtOffset(input_bytes, 1), shift);
+        prev_val = GetUint32AtOffset(input_bytes, 0);
+        cur_val = GetUint32AtOffset(input_bytes, 1);
+        next_val = GetUint32AtOffset(input_bytes, 2);
+		
+        uint32 prev_hash = HashBytes(prev_val, shift);
+        uint32 cur_hash = HashBytes(cur_val, shift);
         candidate = base_ip + table[cur_hash];
         candidate_bytes = UNALIGNED_LOAD32(candidate);
+        table[prev_hash] = ip - base_ip - 1;
         table[cur_hash] = ip - base_ip;
-      } while (GetUint32AtOffset(input_bytes, 1) == candidate_bytes);
+      } while (cur_val == candidate_bytes);
 
-      next_hash = HashBytes(GetUint32AtOffset(input_bytes, 2), shift);
+      next_hash = HashBytes(next_val, shift);
       ++ip;
     }
   }
@@ -636,8 +670,7 @@ class SnappyDecompressor {
     // Length is encoded in 1..5 bytes
     *result = 0;
     uint32 shift = 0;
-    while (true) {
-      if (shift >= 32) return false;
+    for (;;) {
       size_t n;
       const char* ip = reader_->Peek(&n);
       if (n == 0) return false;
@@ -650,6 +683,7 @@ class SnappyDecompressor {
         break;
       }
       shift += 7;
+      if (shift >= 32) return false;
     }
     return true;
   }
@@ -658,10 +692,9 @@ class SnappyDecompressor {
   // Returns true if successful, false on error or end of input.
   template <class Writer>
   void DecompressAllTags(Writer* writer) {
-    const char* ip = ip_;
     // For position-independent executables, accessing global arrays can be
     // slow.  Move wordmask array onto the stack to mitigate this.
-    uint32 wordmask[sizeof(internal::wordmask)/sizeof(uint32)];
+    uint32 wordmask[5];
     // Do not use memcpy to copy internal::wordmask to
     // wordmask.  LLVM converts stack arrays to global arrays if it detects
     // const stack arrays and this hurts the performance of position
@@ -673,6 +706,7 @@ class SnappyDecompressor {
     wordmask[3] = internal::wordmask[3];
     wordmask[4] = internal::wordmask[4];
 
+    const char* ip = ip_;
     // We could have put this refill fragment only at the beginning of the loop.
     // However, duplicating it at the end of each branch gives the compiler more
     // scope to optimize the <ip_limit_ - ip> expression based on the local
@@ -737,22 +771,28 @@ class SnappyDecompressor {
           if (avail == 0) return;  // Premature end of input
           ip_limit_ = ip + avail;
         }
-        if (!writer->Append(ip, literal_length)) {
+        bool append_res = !writer->Append(ip, literal_length);
+        if (SNAPPY_PREDICT_TRUE(append_res)) {
           return;
         }
         ip += literal_length;
         MAYBE_REFILL();
       } else {
+        const uint32 val = LittleEndian::Load32(ip);
         const size_t entry = char_table[c];
-        const size_t trailer = LittleEndian::Load32(ip) & wordmask[entry >> 11];
         const size_t length = entry & 0xff;
-        ip += entry >> 11;
+        const size_t copy_offset = entry & 0x700;
+        const size_t mask_idx = entry >> 11;
+        const uint32 mask = wordmask[mask_idx];
+        const size_t trailer = val & mask;
+        const size_t offset = copy_offset + trailer;
+        ip += mask_idx;
 
         // copy_offset/256 is encoded in bits 8..10.  By just fetching
         // those bits, we get copy_offset (since the bit-field starts at
         // bit 8).
-        const size_t copy_offset = entry & 0x700;
-        if (!writer->AppendFromSelf(copy_offset + trailer, length)) {
+        bool append_res = !writer->AppendFromSelf(offset, length);
+        if (append_res) {
           return;
         }
         MAYBE_REFILL();
